@@ -102,7 +102,7 @@ For a standalone retry of the macOS disassembly extensions:
 
 ```bash
 brew install flex bison texinfo zlib binutils zstd
-ghidra-re plugins install macos-disassembly --force
+ghidra-re plugins install macos-disassembly
 ```
 
 If you want a one-file share bundle:

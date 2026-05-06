@@ -33,7 +33,7 @@ To install: `pip install -e /path/to/ghidra-re-skill`
    - After bootstrap, restart Ghidra and enable GhidraApple analyzers: **Analysis > Analyze All Open Files** (check the GhidraApple entries). This must be done once per project for the ObjC/msgSend/block enrichment to take effect.
    - To skip plugin install: `ghidra-re bootstrap --skip-plugins-install`
    - To install/reinstall the plugin separately: `ghidra-re plugins install ghidraapple`
-   - To retry macOS disassembly support separately: `ghidra-re plugins install macos-disassembly --force`
+   - To retry macOS disassembly support separately: `ghidra-re plugins install macos-disassembly`
    - To check plugin status: `ghidra-re plugins status`
 2. If bootstrap cannot find Ghidra or Java 21, run `ghidra-re doctor`.
 3. On Windows, if the targets live in a mounted or extracted macOS image, register that source first:

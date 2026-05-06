@@ -10,6 +10,7 @@ Currently managed plugins:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import re
@@ -52,6 +53,9 @@ GNU_DISASSEMBLER_EXTENSION_NAME = "GnuDisassembler"
 GNU_DISASSEMBLER_BINUTILS = "binutils-2.41"
 GNU_DISASSEMBLER_BINUTILS_URL = (
     f"https://ftp.gnu.org/pub/gnu/binutils/{GNU_DISASSEMBLER_BINUTILS}.tar.bz2"
+)
+GNU_DISASSEMBLER_BINUTILS_SHA256 = (
+    "a4c4bec052f7b8370024e60389e194377f3f48b56618418ea51067f67aaab30b"
 )
 
 # State file lives next to the bridge install-state file.
@@ -165,25 +169,52 @@ def _is_compatible_installed(extension_name: str) -> bool:
 
 
 def _patch_installed_extension_properties(extension_name: str, **updates: str) -> None:
+    if not updates:
+        return
     user_ext, app_ext = _extension_install_dirs()
     for parent in [user_ext, app_ext]:
         if not parent:
             continue
+        if parent == app_ext and not _extension_dir_writable(parent):
+            continue
         props = parent / extension_name / "extension.properties"
         if not props.exists():
             continue
-        text = props.read_text(encoding="utf-8")
+        original_text = props.read_text(encoding="utf-8")
+        text = original_text
         for key, value in updates.items():
+            replacement = f"{key}={value}"
             if re.search(rf"^{re.escape(key)}=", text, flags=re.MULTILINE):
                 text = re.sub(
                     rf"^{re.escape(key)}=.*$",
-                    f"{key}={value}",
+                    replacement,
                     text,
                     flags=re.MULTILINE,
                 )
             else:
-                text += f"\n{key}={value}\n"
-        props.write_text(text, encoding="utf-8")
+                if text and not text.endswith("\n"):
+                    text += "\n"
+                text += f"{replacement}\n"
+        if text != original_text:
+            _atomic_write_text(props, text)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(path.parent),
+        delete=False,
+    ) as tmp:
+        tmp.write(text)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def _extension_dir_writable(path: Path) -> bool:
+    if path.exists():
+        return path.is_dir() and os.access(path, os.W_OK)
+    return path.parent.exists() and os.access(path.parent, os.W_OK)
 
 
 def _is_installed(extension_name: str) -> bool:
@@ -224,7 +255,7 @@ def _install_zip(zip_path: Path, extension_name: str) -> dict[str, Any]:
         installed_dirs.append(str(dest))
 
         # Also install to app Extensions/<name> if the directory is writable
-        if app_ext and os.access(app_ext.parent, os.W_OK):
+        if app_ext and _extension_dir_writable(app_ext):
             app_ext.mkdir(parents=True, exist_ok=True)
             dest_app = app_ext / extension_name
             if dest_app.exists():
@@ -349,7 +380,9 @@ def _enable_ghidra_apple_in_codebrowser() -> None:
         if not any(p.get("NAME") == "GhidraApple" for p in packages):
             tool.insert(list(tool).index(core) + 1, ET.Element("PACKAGE", {"NAME": "GhidraApple"}))
         ET.indent(tree, space="    ")
-        tree.write(tool_file, encoding="UTF-8", xml_declaration=True)
+        tmp_file = tool_file.with_suffix(tool_file.suffix + ".tmp")
+        tree.write(tmp_file, encoding="UTF-8", xml_declaration=True)
+        tmp_file.replace(tool_file)
     except Exception:
         # Tool XML is user-owned state; never fail plugin installation because
         # a customized or malformed tool config could not be patched.
@@ -384,6 +417,7 @@ def install_ghidra_apple(
         build_from_source = True
 
     if not force and _is_compatible_installed(GHIDRA_APPLE_EXTENSION_NAME):
+        _enable_ghidra_apple_in_codebrowser()
         return {
             "ok": True,
             "status": "already_installed",
@@ -502,10 +536,14 @@ def _patch_ghidra_apple_source_for_ghidra_12(clone_dir: Path) -> None:
         text = text.replace("import ghidra.framework.model.Project\n", "")
         text = text.replace("import ghidra.util.task.TaskMonitor\n", "")
         if "import ghidra.app.util.opinion.Loader\n" not in text:
-            text = text.replace(
+            text, import_count = re.subn(
                 "import ghidra.app.util.opinion.Loaded\n",
                 "import ghidra.app.util.opinion.Loaded\nimport ghidra.app.util.opinion.Loader\n",
+                text,
+                count=1,
             )
+            if import_count != 1:
+                raise RuntimeError("failed to patch GhidraApple Loader import for Ghidra 12")
         new = """    override fun postLoadProgramFixups(
         loadedPrograms: MutableList<Loaded<Program>>,
         settings: Loader.ImporterSettings,
@@ -519,9 +557,9 @@ def _patch_ghidra_apple_source_for_ghidra_12(clone_dir: Path) -> None:
             // This will trigger [getPreferredFileName] above.
             val preferredName = loaded.name
 
-            // If the preferred name is the same as the give name, this probably wasn't
+            // If the preferred name is the same as the given name, this probably wasn't
             // part of a universal binary. Thus, we skip any operations.
-            if (program.name == preferredName) return
+            if (program.name == preferredName) continue
 
             // Otherwise, we rename with the preferred name.
             program.withTransaction<Exception>("rename") {
@@ -544,24 +582,37 @@ def _patch_ghidra_apple_source_for_ghidra_12(clone_dir: Path) -> None:
         }
     }
 """
-        text = re.sub(
+        text, method_count = re.subn(
             r"    override fun postLoadProgramFixups\(\n.*?\n    }\n(?=})",
             new,
             text,
             count=1,
             flags=re.DOTALL,
         )
+        if method_count != 1:
+            raise RuntimeError("failed to patch GhidraApple postLoadProgramFixups for Ghidra 12")
         loader.write_text(text, encoding="utf-8")
 
-    type_injector = clone_dir / "src/main/java/lol/fairplay/ghidraapple/analysis/passes/objcclasses/OCTypeInjectorAnalyzer.kt"
-    if type_injector.exists():
+    patched_signature_setters = False
+    for relative_path in [
+        "src/main/java/lol/fairplay/ghidraapple/analysis/passes/objcclasses/OCTypeInjectorAnalyzer.kt",
+        "src/main/java/lol/fairplay/ghidraapple/analysis/passes/objcclasses/ApplyAllocTypeOverrideCommand.kt",
+    ]:
+        type_injector = clone_dir / relative_path
+        if not type_injector.exists():
+            continue
         text = type_injector.read_text(encoding="utf-8")
+        original_text = text
         text = text.replace("fsig.returnType = type", "fsig.setReturnType(type)")
         text = text.replace(
             'fsig.arguments = arrayOf(ParameterDefinitionImpl("cls", type, null))',
             'fsig.setArguments(ParameterDefinitionImpl("cls", type, null))',
         )
-        type_injector.write_text(text, encoding="utf-8")
+        if text != original_text:
+            type_injector.write_text(text, encoding="utf-8")
+            patched_signature_setters = True
+    if not patched_signature_setters:
+        raise RuntimeError("failed to patch GhidraApple function signature setters for Ghidra 12")
 
 
 def install_sleigh_dev_tools(force: bool = False) -> dict[str, Any]:
@@ -634,9 +685,10 @@ def install_gnu_disassembler(force: bool = False) -> dict[str, Any]:
         )
         module = tmp_root / GNU_DISASSEMBLER_EXTENSION_NAME
         shutil.copytree(source_root / "GPL/GnuDisassembler", module)
-        urllib.request.urlretrieve(
+        _download_verified(
             GNU_DISASSEMBLER_BINUTILS_URL,
             module / f"{GNU_DISASSEMBLER_BINUTILS}.tar.bz2",
+            GNU_DISASSEMBLER_BINUTILS_SHA256,
         )
         _patch_gnu_disassembler_build(module)
         env = {
@@ -702,19 +754,56 @@ def _homebrew_build_path(existing_path: str) -> str:
     return os.pathsep.join([p for p in prefixes if Path(p).exists()] + [existing_path])
 
 
+def _download_verified(url: str, destination: Path, sha256: str) -> None:
+    urllib.request.urlretrieve(url, destination)
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    if digest.lower() != sha256.lower():
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"checksum mismatch for {url}: expected {sha256}, got {digest}"
+        )
+
+
 def _ensure_gnu_disassembler_build_tools() -> None:
     path = _homebrew_build_path(os.environ.get("PATH", ""))
     missing = [
         tool
-        for tool in ["flex", "bison", "makeinfo"]
+        for tool in ["flex", "bison", "makeinfo", "objdump"]
         if not shutil.which(tool, path=path)
     ]
+    missing.extend(_missing_dependency_files())
     if missing:
         raise RuntimeError(
             "missing build tools for GnuDisassembler: "
             + ", ".join(missing)
             + ". On macOS install them with: brew install flex bison texinfo zlib binutils zstd"
         )
+
+
+def _missing_dependency_files() -> list[str]:
+    checks = {
+        "flex headers": [
+            "/opt/homebrew/opt/flex/include/FlexLexer.h",
+            "/usr/local/opt/flex/include/FlexLexer.h",
+        ],
+        "zlib headers": [
+            "/opt/homebrew/opt/zlib/include/zlib.h",
+            "/usr/local/opt/zlib/include/zlib.h",
+        ],
+        "zstd headers": [
+            "/opt/homebrew/include/zstd.h",
+            "/opt/homebrew/opt/zstd/include/zstd.h",
+            "/usr/local/include/zstd.h",
+            "/usr/local/opt/zstd/include/zstd.h",
+        ],
+        "zstd library": [
+            "/opt/homebrew/lib/libzstd.dylib",
+            "/opt/homebrew/opt/zstd/lib/libzstd.dylib",
+            "/usr/local/lib/libzstd.dylib",
+            "/usr/local/opt/zstd/lib/libzstd.dylib",
+        ],
+    }
+    return [name for name, paths in checks.items() if not any(Path(p).exists() for p in paths)]
 
 
 def _homebrew_cppflags() -> str:
@@ -746,16 +835,20 @@ def _homebrew_ldflags() -> str:
 def _patch_gnu_disassembler_build(module: Path) -> None:
     build = module / "buildGdis.gradle"
     text = build.read_text(encoding="utf-8")
-    text = text.replace(
-        '"-lopcodes", "-lbfd", "-lsframe", "-liberty", "-lz", "-ldl"',
-        '"-lopcodes", "-lbfd", "-lsframe", "-liberty", "-lz", "-lzstd", "-ldl"',
-    )
+    if '"-lzstd"' not in text:
+        text, zstd_count = re.subn(r'("-lz"\s*,)', r'\1 "-lzstd",', text, count=1)
+        if zstd_count != 1:
+            raise RuntimeError("failed to patch GnuDisassembler zstd linker argument")
     for lib_dir in ["/opt/homebrew/lib", "/usr/local/lib"]:
         if Path(lib_dir).exists() and f'"-L{lib_dir}"' not in text:
-            text = text.replace(
-                'linker.args "-L${binutilsArtifactsDir}/lib", ',
-                f'linker.args "-L${{binutilsArtifactsDir}}/lib", "-L{lib_dir}", ',
+            text, lib_count = re.subn(
+                r'(linker\.args\s+"-L\$\{binutilsArtifactsDir\}/lib")',
+                rf'\1, "-L{lib_dir}"',
+                text,
+                count=1,
             )
+            if lib_count != 1:
+                raise RuntimeError("failed to patch GnuDisassembler Homebrew linker path")
             break
     build.write_text(text, encoding="utf-8")
 
@@ -763,12 +856,15 @@ def _patch_gnu_disassembler_build(module: Path) -> None:
 def _patch_binutils_zlib(module: Path) -> None:
     zutil = module / "build" / GNU_DISASSEMBLER_BINUTILS / "zlib" / "zutil.h"
     if not zutil.exists():
-        return
+        raise RuntimeError(f"expected binutils zlib header not found at {zutil}")
     text = zutil.read_text(encoding="utf-8", errors="ignore")
-    text = text.replace(
-        "#if defined(MACOS) || defined(TARGET_OS_MAC)",
-        "#if !defined(__APPLE__) && (defined(MACOS) || defined(TARGET_OS_MAC))",
+    target = "#if defined(MACOS) || defined(TARGET_OS_MAC)"
+    replacement = (
+        "#if !defined(__APPLE__) && (defined(MACOS) || defined(TARGET_OS_MAC))"
     )
+    if target not in text:
+        raise RuntimeError("failed to patch binutils zlib macOS fdopen guard")
+    text = text.replace(target, replacement, 1)
     zutil.write_text(text, encoding="utf-8")
 
 
@@ -779,7 +875,7 @@ def _install_gnu_disassembler_tree(module: Path, gdis: Path, platform_name: str)
     for parent in [user_ext, app_ext]:
         if not parent:
             continue
-        if parent == app_ext and not os.access(parent.parent, os.W_OK):
+        if parent == app_ext and not _extension_dir_writable(parent):
             continue
         parent.mkdir(parents=True, exist_ok=True)
         dest = parent / GNU_DISASSEMBLER_EXTENSION_NAME

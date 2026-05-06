@@ -242,7 +242,7 @@ def bootstrap(
             # macOS RE workflows should get a clear retry path.
             disassembly_status_str = f"failed ({e})"
             console.print(f"[yellow]Warning:[/yellow] macOS disassembler extension install failed: {e}")
-            console.print("[dim]Run 'ghidra-re plugins install macos-disassembly --force' to retry.[/dim]")
+            console.print("[dim]Run 'ghidra-re plugins install macos-disassembly' to retry.[/dim]")
 
     console.print(f"Skill root: {cfg.skill_root}")
     console.print(f"Ghidra: {detected_ghidra}")
