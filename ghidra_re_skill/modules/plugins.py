@@ -160,12 +160,99 @@ def _extension_version(extension_name: str) -> str | None:
     return None
 
 
+def _installed_extension_dirs(extension_name: str) -> list[Path]:
+    try:
+        user_ext, app_ext = _extension_install_dirs()
+    except Exception:
+        return []
+    paths: list[Path] = []
+    for parent in [user_ext, app_ext]:
+        if not parent:
+            continue
+        path = parent / extension_name
+        if path.exists():
+            paths.append(path)
+    return paths
+
+
 def _is_compatible_installed(extension_name: str) -> bool:
     if not _is_installed(extension_name):
         return False
     installed_version = _extension_version(extension_name)
     ghidra_version = _ghidra_application_version()
-    return bool(installed_version and ghidra_version and installed_version == ghidra_version)
+    if not (installed_version and ghidra_version and installed_version == ghidra_version):
+        return False
+    if extension_name == GNU_DISASSEMBLER_EXTENSION_NAME and is_macos():
+        return _gnu_disassembler_native_provider_ready()
+    return True
+
+
+def _gnu_disassembler_native_provider_ready() -> bool:
+    platform_name = _native_platform_name()
+    extension_dirs = _installed_extension_dirs(GNU_DISASSEMBLER_EXTENSION_NAME)
+    if not extension_dirs:
+        return False
+    for path in extension_dirs:
+        gdis = path / "os" / platform_name / "gdis"
+        if not _native_gdis_ready(gdis):
+            return False
+    return True
+
+
+def _native_gdis_ready(gdis: Path) -> bool:
+    if not (gdis.is_file() and os.access(gdis, os.X_OK)):
+        return False
+    file_tool = shutil.which("file") or "/usr/bin/file"
+    result = subprocess.run(
+        [file_tool, str(gdis)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    return _native_arch_token() in result.stdout
+
+
+def _native_arch_token() -> str:
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+    if machine in {"x86_64", "amd64"}:
+        return "x86_64"
+    raise RuntimeError(f"unsupported macOS architecture for GnuDisassembler: {machine}")
+
+
+def _gnu_disassembler_skip_details() -> dict[str, Any]:
+    platform_name = _native_platform_name()
+    return {
+        "native_platform": platform_name,
+        "native_providers": [
+            str(path / "os" / platform_name / "gdis")
+            for path in _installed_extension_dirs(GNU_DISASSEMBLER_EXTENSION_NAME)
+        ],
+    }
+
+
+def _gnu_disassembler_status_details() -> dict[str, Any]:
+    platform_name = _native_platform_name() if is_macos() else None
+    native_providers: list[dict[str, Any]] = []
+    if platform_name:
+        for path in _installed_extension_dirs(GNU_DISASSEMBLER_EXTENSION_NAME):
+            gdis = path / "os" / platform_name / "gdis"
+            native_providers.append({
+                "path": str(gdis),
+                "exists": gdis.is_file(),
+                "executable": gdis.is_file() and os.access(gdis, os.X_OK),
+                "matches_arch": _native_gdis_ready(gdis),
+            })
+    return {
+        "native_platform": platform_name,
+        "native_provider_ready": (
+            _gnu_disassembler_native_provider_ready() if is_macos() else None
+        ),
+        "native_providers": native_providers,
+    }
 
 
 def _patch_installed_extension_properties(extension_name: str, **updates: str) -> None:
@@ -671,6 +758,7 @@ def install_gnu_disassembler(force: bool = False) -> dict[str, Any]:
             "ok": True,
             "status": "already_installed",
             "extension": GNU_DISASSEMBLER_EXTENSION_NAME,
+            **_gnu_disassembler_skip_details(),
         }
     _ensure_gnu_disassembler_build_tools()
     gradle = _find_gradle()
@@ -933,13 +1021,16 @@ def plugin_status() -> dict[str, Any]:
 
     for extension_name in [SLEIGH_DEV_TOOLS_EXTENSION_NAME, GNU_DISASSEMBLER_EXTENSION_NAME]:
         entry = state.get(extension_name, {})
-        plugins.append({
+        plugin = {
             "name": extension_name,
             "installed": _is_installed(extension_name),
             "install_method": entry.get("installed_method"),
             "installed_version": _extension_version(extension_name),
             "compatible": _is_compatible_installed(extension_name),
             "installed_dirs": entry.get("installed_dirs", []),
-        })
+        }
+        if extension_name == GNU_DISASSEMBLER_EXTENSION_NAME:
+            plugin.update(_gnu_disassembler_status_details())
+        plugins.append(plugin)
 
     return {"plugins": plugins}
